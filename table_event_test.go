@@ -1,0 +1,202 @@
+package pgchan_test
+
+import (
+	"cmp"
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/crhntr/pgchan"
+)
+
+func TestOneTable(t *testing.T) {
+	ctx := context.TODO()
+	dbURL := setupPostgresDocker(t, "pg_chan_all_tables")
+	conn, err := pgx.Connect(ctx, dbURL)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+
+	_, err = conn.Exec(ctx, `CREATE TABLE some_table (
+		id    serial PRIMARY KEY,
+		value text   NOT NULL
+	)`)
+
+	listenerCtx, listenerCancel := context.WithCancel(ctx)
+
+	c := make(chan pgchan.TableEvent)
+	wg := errgroup.Group{}
+	wg.Go(func() error {
+		defer close(c)
+		return pgchan.TableEvents(listenerCtx, dbURL, c)
+	})
+	wg.Go(func() error {
+		ticker := time.NewTicker(time.Second / 10)
+		deadline := time.After(time.Second * 10)
+		value := 1
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-deadline:
+				return fmt.Errorf("timed out waiting for table events")
+			case <-c:
+				listenerCancel()
+				return nil // ok, table event received
+			case <-ticker.C:
+				if _, err := conn.Exec(ctx, `INSERT INTO some_table (value) VALUES ($1);`, strconv.Itoa(value)); err != nil {
+					return err
+				}
+				value++
+			}
+		}
+	})
+	require.NoError(t, wg.Wait())
+}
+
+// setupPostgresDocker pulls the PostgreSQL Docker image, stops/removes an existing container
+// (if any), and then starts a new container with the given configuration.
+func setupPostgresDocker(t *testing.T, containerName string) string {
+	t.Helper()
+
+	var (
+		postgresUser     = cmp.Or(os.Getenv("POSTGRES_USER"), "pgchan_test_user")
+		postgresPassword = cmp.Or(os.Getenv("POSTGRES_PASSWORD"), "pgchan_test_password")
+		postgresDB       = cmp.Or(os.Getenv("DATABASE_NAME"), "pgchan_test")
+		postgresImage    = cmp.Or(os.Getenv("POSTGRES_IMAGE"), "postgres")
+		hostPort         = cmp.Or(os.Getenv("HOST_PORT"), freePort(t))
+	)
+
+	t.Logf("Using Docker container name: %s", containerName)
+	t.Logf("Using PostgreSQL image: %s", postgresImage)
+
+	// Pull the PostgreSQL Docker image.
+	t.Logf("Pulling PostgreSQL Docker image %q...", postgresImage)
+	if output, err := exec.Command("docker", "pull", postgresImage).CombinedOutput(); err != nil {
+		t.Fatalf("failed to pull image %q: %v\nOutput: %s", postgresImage, err, string(output))
+	}
+
+	// Check if a container with the specified name already exists.
+	out, err := exec.Command("docker", "ps", "-aq", "-f", fmt.Sprintf("name=%s", containerName)).Output()
+	if err != nil {
+		t.Fatalf("failed to check for existing container %q: %v", containerName, err)
+	}
+
+	if containerID := strings.TrimSpace(string(out)); containerID != "" {
+		t.Logf("A container named %q already exists.", containerName)
+
+		// If the container is running, stop it.
+		checkRunningCmd := exec.Command("docker", "ps", "-aq", "-f", "status=running", "-f", fmt.Sprintf("name=%s", containerName))
+		runningOut, err := checkRunningCmd.Output()
+		if err != nil {
+			t.Fatalf("failed to check if container %q is running: %v", containerName, err)
+		}
+		if runningID := strings.TrimSpace(string(runningOut)); runningID != "" {
+			t.Logf("Stopping the running container %q...", containerName)
+			if output, err := exec.Command("docker", "stop", containerName).CombinedOutput(); err != nil {
+				t.Fatalf("failed to stop container %q: %v\nOutput: %s", containerName, err, string(output))
+			}
+		}
+
+		// Remove the existing container.
+		t.Logf("Removing the existing container %q...", containerName)
+		if output, err := exec.Command("docker", "rm", containerName).CombinedOutput(); err != nil {
+			t.Fatalf("failed to remove container %q: %v\nOutput: %s", containerName, err, string(output))
+		}
+	}
+
+	// Run the new container.
+	runArgs := []string{
+		"run", "-d",
+		"--name", containerName,
+		"-p", fmt.Sprintf("%s:5432", hostPort),
+		"-e", fmt.Sprintf("POSTGRES_USER=%s", postgresUser),
+		"-e", fmt.Sprintf("POSTGRES_PASSWORD=%s", postgresPassword),
+		"-e", fmt.Sprintf("POSTGRES_DB=%s", postgresDB),
+		postgresImage,
+		"postgres", "-c", "wal_level=logical",
+	}
+	t.Logf("Starting a new container %q...", containerName)
+	if output, err := exec.Command("docker", runArgs...).CombinedOutput(); err != nil {
+		t.Fatalf("failed to start container %q: %v\nOutput: %s", containerName, err, string(output))
+	}
+
+	t.Logf("Container %q is set up and running.", containerName)
+
+	connStr := fmt.Sprintf("postgres://%s:%s@localhost:%s/%s?sslmode=disable",
+		postgresUser, postgresPassword, hostPort, postgresDB)
+
+	if err := ensureDBConnection(t, connStr); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("PostgreSQL connection string: %s", connStr)
+	return connStr
+}
+
+func ensureDBConnection(t *testing.T, connStr string) error {
+	t.Helper()
+	var connErr error
+	for try := 1; try <= 5; try++ {
+		time.Sleep(time.Second * time.Duration(try-1))
+		if err := tryConnectAndPing(connStr); err != nil {
+			connErr = err
+			continue
+		}
+		return nil
+	}
+	return connErr
+}
+
+func tryConnectAndPing(connStr string) error {
+	ctx, cancel := context.WithTimeout(context.TODO(), time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		return err
+	}
+	if err := conn.Ping(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func freePort(t *testing.T) string {
+	t.Helper()
+
+	// Listen on a random port.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to acquire a free port: %v", err)
+	}
+	defer closeAndLogError(t, l)
+
+	// Extract the port number from the listener's address.
+	addr, ok := l.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("failed to cast listener address to *net.TCPAddr")
+	}
+
+	return strconv.Itoa(addr.Port)
+}
+
+func closeAndLogError(t *testing.T, closer io.Closer) {
+	t.Helper()
+	if err := closer.Close(); err != nil {
+		t.Logf("failed to close connection: %v", err)
+	}
+}

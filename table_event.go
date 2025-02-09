@@ -3,6 +3,7 @@ package pgchan
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -64,7 +65,7 @@ func TableEvents(ctx context.Context, databaseURL string, c chan<- TableEvent, t
 
 	nTables := len(tableNames)
 
-	return runWithDBConnection(ctx, databaseURL, func(ctx context.Context, conn *pgconn.PgConn) error {
+	if err := runWithDBConnection(ctx, databaseURL, func(ctx context.Context, conn *pgconn.PgConn) error {
 		pubName, slotName := newPublicationName(databaseURLConfig), newSlotName(databaseURLConfig)
 		sys, err := ensureSlotAndPublicationExist(ctx, conn, pubName, slotName, tableNames...)
 		if err != nil {
@@ -138,7 +139,10 @@ func TableEvents(ctx context.Context, databaseURL string, c chan<- TableEvent, t
 			}
 			return nil
 		})
-	})
+	}); !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
 }
 
 type relation struct {
@@ -240,25 +244,8 @@ func receiveMessage(ctx context.Context, conn *pgconn.PgConn, deadline time.Time
 }
 
 func ensureSlotAndPublicationExist(ctx context.Context, conn *pgconn.PgConn, pubName, slotName string, tableNames ...string) (pglogrepl.IdentifySystemResult, error) {
-	result := conn.Exec(ctx, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s;", pubName))
-	if _, err := result.ReadAll(); err != nil {
+	if err := createPublication(ctx, conn, pubName, tableNames); err != nil {
 		return pglogrepl.IdentifySystemResult{}, err
-	}
-
-	if len(tableNames) > 0 {
-		tn := slices.Clone(tableNames)
-		for i, n := range tn {
-			tn[i] = strconv.Quote(n)
-		}
-		result = conn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR %s;", pubName, strings.Join(tn, ", ")))
-		if _, err := result.ReadAll(); err != nil {
-			return pglogrepl.IdentifySystemResult{}, err
-		}
-	} else {
-		result = conn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES;", pubName))
-		if _, err := result.ReadAll(); err != nil {
-			return pglogrepl.IdentifySystemResult{}, err
-		}
 	}
 
 	sys, err := pglogrepl.IdentifySystem(ctx, conn)
@@ -350,4 +337,47 @@ func ensureDatabaseReplication(databaseURL string) (string, error) {
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+func createPublication(ctx context.Context, conn *pgconn.PgConn, pubName string, tableNames []string) error {
+	if err := dropPublicationIfExists(ctx, conn, pubName); err != nil {
+		return err
+	}
+	if len(tableNames) > 0 {
+		if err := createPublicationForTables(ctx, conn, pubName, tableNames); err != nil {
+			return err
+		}
+	} else {
+		if err := createPublicationForAllTables(ctx, conn, pubName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func dropPublicationIfExists(ctx context.Context, conn *pgconn.PgConn, pubName string) error {
+	if _, err := conn.Exec(ctx, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s;", pubName)).ReadAll(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func createPublicationForTables(ctx context.Context, conn *pgconn.PgConn, pubName string, tableNames []string) error {
+	tn := slices.Clone(tableNames)
+	for i, n := range tn {
+		tn[i] = strconv.Quote(n)
+	}
+	result := conn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR %s;", pubName, strings.Join(tn, ", ")))
+	if _, err := result.ReadAll(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func createPublicationForAllTables(ctx context.Context, conn *pgconn.PgConn, pubName string) error {
+	result := conn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES;", pubName))
+	if _, err := result.ReadAll(); err != nil {
+		return err
+	}
+	return nil
 }
