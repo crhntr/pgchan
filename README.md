@@ -1,3 +1,3 @@
 # Postgres Channel Utilities
 
-Channels are pretty cool. This package maps some postgres events to channels.
+I am thinking of using this package as a utility in a Change Data Capture tool.
