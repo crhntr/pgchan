@@ -3,8 +3,11 @@ package pgchan
 import (
 	"cmp"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/url"
@@ -64,9 +67,10 @@ func TableEvents(ctx context.Context, databaseURL string, c chan<- TableEvent, t
 	}
 
 	nTables := len(tableNames)
+	suffix := identifierSuffix(tableNames)
 
 	if err := runWithDBConnection(ctx, databaseURL, func(ctx context.Context, conn *pgconn.PgConn) error {
-		pubName, slotName := newPublicationName(databaseURLConfig), newSlotName(databaseURLConfig)
+		pubName, slotName := newPublicationName(databaseURLConfig, suffix), newSlotName(databaseURLConfig, suffix)
 		sys, err := ensureSlotAndPublicationExist(ctx, conn, pubName, slotName, tableNames...)
 		if err != nil {
 			return err
@@ -145,6 +149,19 @@ func TableEvents(ctx context.Context, databaseURL string, c chan<- TableEvent, t
 	return nil
 }
 
+func identifierSuffix(tableNames []string) string {
+	if len(tableNames) == 0 {
+		return "all"
+	}
+	sum := sha1.New()
+	for _, n := range tableNames {
+		_, _ = io.WriteString(sum, n)
+	}
+	suffix := hex.EncodeToString(sum.Sum(nil))
+	suffix = suffix[:min(len(suffix), 8)]
+	return suffix
+}
+
 type relation struct {
 	Name      string
 	Namespace string
@@ -197,16 +214,22 @@ func receiveMessage(ctx context.Context, conn *pgconn.PgConn, deadline time.Time
 		if pgconn.Timeout(err) {
 			return true, nil
 		}
-		slog.Error("failed to receive message", "error", err, "lsn", clientXLogPos)
+		if !errors.Is(err, context.Canceled) {
+			slog.Error("failed to receive message", "error", err, "lsn", clientXLogPos)
+		}
 	}
 
 	if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
 		log.Fatalf("received Postgres WAL error: %+v", errMsg)
 	}
 
+	if rawMsg == nil {
+		return false, nil
+	}
+
 	msg, ok := rawMsg.(*pgproto3.CopyData)
 	if !ok {
-		slog.Error("received unexpected message", "type", reflect.TypeOf(msg).String())
+		slog.Error("received unexpected message", "type", reflect.TypeOf(rawMsg).String())
 		return true, nil
 	}
 
@@ -318,12 +341,20 @@ func sanitizeName(name string) string {
 	return n
 }
 
-func newSlotName(config *pgx.ConnConfig) string {
-	return strings.Join([]string{cmp.Or(sanitizeName(config.Database), "postgres"), "slot"}, "_")
+func newSlotName(config *pgx.ConnConfig, suffix string) string {
+	parts := []string{cmp.Or(sanitizeName(config.Database), "postgres"), "slot"}
+	if suffix != "" {
+		parts = append(parts, suffix)
+	}
+	return strings.Join(parts, "_")
 }
 
-func newPublicationName(config *pgx.ConnConfig) string {
-	return strings.Join([]string{cmp.Or(sanitizeName(config.Database), "postgres"), "pub"}, "_")
+func newPublicationName(config *pgx.ConnConfig, suffix string) string {
+	parts := []string{cmp.Or(sanitizeName(config.Database), "postgres"), "pub"}
+	if suffix != "" {
+		parts = append(parts, suffix)
+	}
+	return strings.Join(parts, "_")
 }
 
 func ensureDatabaseReplication(databaseURL string) (string, error) {
@@ -343,16 +374,11 @@ func createPublication(ctx context.Context, conn *pgconn.PgConn, pubName string,
 	if err := dropPublicationIfExists(ctx, conn, pubName); err != nil {
 		return err
 	}
-	if len(tableNames) > 0 {
-		if err := createPublicationForTables(ctx, conn, pubName, tableNames); err != nil {
-			return err
-		}
+	if len(tableNames) == 0 {
+		return createPublicationForAllTables(ctx, conn, pubName)
 	} else {
-		if err := createPublicationForAllTables(ctx, conn, pubName); err != nil {
-			return err
-		}
+		return createPublicationForTables(ctx, conn, pubName, tableNames)
 	}
-	return nil
 }
 
 func dropPublicationIfExists(ctx context.Context, conn *pgconn.PgConn, pubName string) error {
@@ -365,9 +391,9 @@ func dropPublicationIfExists(ctx context.Context, conn *pgconn.PgConn, pubName s
 func createPublicationForTables(ctx context.Context, conn *pgconn.PgConn, pubName string, tableNames []string) error {
 	tn := slices.Clone(tableNames)
 	for i, n := range tn {
-		tn[i] = strconv.Quote(n)
+		tn[i] = strconv.Quote(strings.TrimSpace(n))
 	}
-	result := conn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR %s;", pubName, strings.Join(tn, ", ")))
+	result := conn.Exec(ctx, fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s;", pubName, strings.Join(tn, ", ")))
 	if _, err := result.ReadAll(); err != nil {
 		return err
 	}

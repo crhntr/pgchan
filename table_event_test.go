@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -66,6 +67,94 @@ func TestOneTable(t *testing.T) {
 		}
 	})
 	require.NoError(t, wg.Wait())
+}
+
+func TestSomeTables(t *testing.T) {
+	ctx := context.TODO()
+	dbURL := setupPostgresDocker(t, "pg_chan_some_tables")
+	conn, err := pgx.Connect(ctx, dbURL)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if err := conn.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+
+	for _, sql := range []string{
+		`CREATE TABLE some_other_table (id serial PRIMARY KEY, value text NOT NULL)`,
+		`CREATE TABLE some_table (id serial PRIMARY KEY, value text NOT NULL)`,
+	} {
+		_, err = conn.Exec(ctx, sql)
+		require.NoError(t, err)
+	}
+
+	listenerCtx, listenerCancel := context.WithCancel(ctx)
+
+	all := make(chan pgchan.TableEvent)
+	one := make(chan pgchan.TableEvent)
+	wg := errgroup.Group{}
+	wg.Go(func() error {
+		defer close(all)
+		return pgchan.TableEvents(listenerCtx, dbURL, all)
+	})
+	wg.Go(func() error {
+		defer close(one)
+		return pgchan.TableEvents(listenerCtx, dbURL, one, "some_table")
+	})
+	wg.Go(func() error {
+
+		ticker := time.NewTicker(time.Second / 20)
+		deadline := time.After(time.Second * 3)
+		someEventCount, allTablesEventCount := 0, 0
+		value := 1
+		addToSomeTable := new(sync.Once)
+
+		channelCount := 2
+		for loop := 1; channelCount > 0; loop++ {
+			// t.Logf("[for select] loop=%d value=%d some=%d all=%d", value, loop, allTablesEventCount, someEventCount)
+			select {
+			case <-deadline:
+				t.Error("[<-deadline] timed out waiting for table events")
+			case e, more := <-one:
+				if !more {
+					channelCount--
+					continue
+				}
+				someEventCount++
+				t.Logf("[<-one] table event [all: %d, some: %d]: %#v", allTablesEventCount, someEventCount, e)
+			case e, more := <-all:
+				if !more {
+					channelCount--
+					continue
+				}
+				allTablesEventCount++
+				t.Logf("[<-all] table event: [all: %d, some: %d] %#v", allTablesEventCount, someEventCount, e)
+				if allTablesEventCount > 5 && someEventCount >= 1 {
+					listenerCancel()
+				}
+			case <-ticker.C:
+				t.Logf("[<-ticker.C] insert into some_other_table: %d", value)
+				insertValueIntoTable(t, conn, "some_other_table", value)
+				if allTablesEventCount > 1 {
+					addToSomeTable.Do(func() {
+						t.Logf("[tick] insert into some_table: %d", value)
+						insertValueIntoTable(t, conn, "some_table", value)
+					})
+				}
+				value++
+			}
+		}
+		return nil
+	})
+	require.NoError(t, wg.Wait())
+}
+
+func insertValueIntoTable(t *testing.T, conn *pgx.Conn, name string, value int) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (value) VALUES ($1);`, name), strconv.Itoa(value)); err != nil {
+		t.Error(err)
+	}
 }
 
 // setupPostgresDocker pulls the PostgreSQL Docker image, stops/removes an existing container
