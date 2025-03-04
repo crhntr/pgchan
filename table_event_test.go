@@ -22,7 +22,7 @@ import (
 )
 
 func TestOneTable(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	dbURL := setupPostgresDocker(t, "pg_chan_all_tables")
 	conn, err := pgx.Connect(ctx, dbURL)
 	require.NoError(t, err)
@@ -70,7 +70,7 @@ func TestOneTable(t *testing.T) {
 }
 
 func TestSomeTables(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	dbURL := setupPostgresDocker(t, "pg_chan_some_tables")
 	conn, err := pgx.Connect(ctx, dbURL)
 	require.NoError(t, err)
